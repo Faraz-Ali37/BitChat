@@ -455,6 +455,11 @@ fun DebugSettingsSheet(
                 }
             }
 
+            // Flood-authorization allowlist (only trusted peer fingerprints get relayed)
+            item {
+                AuthorizedSendersSection(meshService = meshService)
+            }
+
             // Transport toggles (BLE + Wi‑Fi Aware)
             item {
                 Surface(shape = RoundedCornerShape(12.dp), color = colorScheme.surfaceVariant.copy(alpha = 0.2f)) {

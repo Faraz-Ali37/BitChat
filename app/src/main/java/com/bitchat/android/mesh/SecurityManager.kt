@@ -93,6 +93,17 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
             return false
         }
 
+        // Flood-authorization allowlist: only applies to packet types that get
+        // broadcast/flooded across the whole mesh (public messages, files). Handshakes,
+        // announces, leaves, sync, etc. are left untouched so presence/discovery and
+        // private (directly-addressed) traffic keep working normally even when this
+        // policy is on. Returning false here drops the packet before it reaches
+        // PacketRelayManager, so an unauthorized message is neither shown locally nor
+        // relayed onward by this node.
+        if (!isAuthorizedToFlood(packet, peerID)) {
+            return false
+        }
+
         // Record only authenticated packets. Recording an attacker-controlled
         // invalid packet first would let it poison duplicate detection for a
         // later legitimate packet with the same timestamp and payload.
@@ -353,6 +364,43 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
         }
     }
     
+    /**
+     * Enforce the flood-authorization allowlist (see [AuthorizedSendersManager]) for the
+     * subset of packet types that actually get flooded across the whole mesh. Every other
+     * packet type (handshakes, ANNOUNCE, LEAVE, REQUEST_SYNC, fragments, etc.) is exempt so
+     * peer discovery and private messaging are unaffected by this policy.
+     *
+     * The identity check is anchored to the peer's Noise static public key fingerprint,
+     * i.e. the same identity already established via [verifyPacketSignature] for this
+     * packet (ANNOUNCE binds the signing key to the Noise key, and every MESSAGE/
+     * FILE_TRANSFER signature above was just verified against that bound signing key) —
+     * so a peer cannot pass this check without having proven ownership of the key first.
+     */
+    private fun isAuthorizedToFlood(packet: BitchatPacket, peerID: String): Boolean {
+        val messageType = MessageType.fromValue(packet.type)
+        if (messageType != MessageType.MESSAGE && messageType != MessageType.FILE_TRANSFER) {
+            return true
+        }
+
+        val authManager = AuthorizedSendersManager.getInstance()
+        if (!authManager.isEnabled()) {
+            return true
+        }
+
+        val noisePublicKey = delegate?.getPeerInfo(peerID)?.noisePublicKey
+        if (noisePublicKey == null) {
+            Log.w(TAG, "Dropping $messageType from $peerID: no verified identity key on file yet")
+            return false
+        }
+
+        val fingerprint = PeerFingerprintManager.fingerprintFor(noisePublicKey)
+        val authorized = authManager.isAuthorized(fingerprint)
+        if (!authorized) {
+            Log.w(TAG, "Dropping $messageType from $peerID: sender is not on the flood-authorized list")
+        }
+        return authorized
+    }
+
     /**
      * Check if we have encryption keys for a peer
      */

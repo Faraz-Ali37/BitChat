@@ -35,6 +35,19 @@ class PeerFingerprintManager private constructor() {
                 INSTANCE ?: PeerFingerprintManager().also { INSTANCE = it }
             }
         }
+
+        /**
+         * Public, stateless helper to compute the SHA-256 fingerprint for any static public key.
+         * Exposed so other components (e.g. AuthorizedSendersManager) can compare a peer's
+         * verified key against a stored allowlist using the exact same identity representation
+         * shown to users elsewhere in the app (VerificationSheet, etc.), without needing an
+         * established peer/session entry.
+         */
+        fun fingerprintFor(publicKey: ByteArray): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val hash = digest.digest(publicKey)
+            return hash.joinToString("") { "%02x".format(it) }
+        }
     }
     
     // Bidirectional mapping for efficient lookups

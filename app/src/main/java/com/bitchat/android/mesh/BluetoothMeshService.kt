@@ -1393,6 +1393,12 @@ class BluetoothMeshService(private val context: Context) : TransportBridgeServic
      * Get peer nicknames
      */
     fun getPeerNicknames(): Map<String, String> = peerManager.getAllPeerNicknames()
+
+    /**
+     * Get currently active peer IDs (for UI surfaces that need a live peer list,
+     * e.g. the flood-authorization allowlist editor)
+     */
+    fun getActivePeerIDs(): List<String> = peerManager.getActivePeerIDs()
     
     /**
      * Get peer RSSI values  

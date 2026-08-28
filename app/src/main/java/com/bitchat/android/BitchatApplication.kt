@@ -54,6 +54,15 @@ class BitchatApplication : Application() {
         // Initialize debug preference manager (persists debug toggles)
         try { com.bitchat.android.ui.debug.DebugPreferenceManager.init(this) } catch (_: Exception) { }
 
+        // Initialize the flood-authorization allowlist (persists the enable flag + trusted
+        // sender fingerprints used to gate public message relay — see SecurityManager).
+        try {
+            com.bitchat.android.mesh.AuthorizedSendersPreferenceManager.init(this)
+            // Re-read persisted values now that prefs are ready, in case
+            // AuthorizedSendersManager.getInstance() was created earlier with defaults.
+            com.bitchat.android.mesh.AuthorizedSendersManager.getInstance().reloadFromPreferences()
+        } catch (_: Exception) { }
+
         // Initialize Wi‑Fi Aware controller with persisted default
         try {
             val enabled = com.bitchat.android.ui.debug.DebugPreferenceManager.getWifiAwareEnabled(false)
