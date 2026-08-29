@@ -5,6 +5,18 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
+ * A single dropped MESSAGE/FILE_TRANSFER packet, recorded for display so the effect of
+ * the allowlist is visible in the UI in real time rather than a silent no-op.
+ */
+data class BlockedFloodAttempt(
+    val fingerprint: String,
+    val peerID: String,
+    val nickname: String,
+    val messageType: String,
+    val timestamp: Long
+)
+
+/**
  * Flood-authorization allowlist.
  *
  * When enabled, [SecurityManager] consults this manager to decide whether a public
@@ -31,6 +43,10 @@ class AuthorizedSendersManager private constructor() {
                 INSTANCE ?: AuthorizedSendersManager().also { INSTANCE = it }
             }
         }
+
+        // Bounded so a determined unauthorized sender can't grow this list forever;
+        // it only needs to be big enough to be visibly useful in a live demo/debug view.
+        private const val MAX_BLOCKED_ATTEMPTS = 50
     }
 
     private val _enabled = MutableStateFlow(false)
@@ -38,6 +54,11 @@ class AuthorizedSendersManager private constructor() {
 
     private val _authorizedFingerprints = MutableStateFlow<Set<String>>(emptySet())
     val authorizedFingerprints: StateFlow<Set<String>> = _authorizedFingerprints.asStateFlow()
+
+    // In-memory only (not persisted): this is a live "is it working" signal for the
+    // current session, not an audit trail, so it intentionally resets on app restart.
+    private val _blockedAttempts = MutableStateFlow<List<BlockedFloodAttempt>>(emptyList())
+    val blockedAttempts: StateFlow<List<BlockedFloodAttempt>> = _blockedAttempts.asStateFlow()
 
     init {
         try {
@@ -91,9 +112,31 @@ class AuthorizedSendersManager private constructor() {
         try { AuthorizedSendersPreferenceManager.setAuthorizedFingerprints(updated) } catch (_: Exception) { }
     }
 
+    /**
+     * Record a dropped MESSAGE/FILE_TRANSFER packet so it's visible in the UI. Called by
+     * [SecurityManager] at the exact point a packet is rejected — see
+     * SecurityManager.isAuthorizedToFlood.
+     */
+    fun recordBlockedAttempt(fingerprint: String, peerID: String, nickname: String, messageType: String) {
+        val attempt = BlockedFloodAttempt(
+            fingerprint = fingerprint,
+            peerID = peerID,
+            nickname = nickname,
+            messageType = messageType,
+            timestamp = System.currentTimeMillis()
+        )
+        // Newest first, capped.
+        _blockedAttempts.value = (listOf(attempt) + _blockedAttempts.value).take(MAX_BLOCKED_ATTEMPTS)
+    }
+
+    fun clearBlockedAttempts() {
+        _blockedAttempts.value = emptyList()
+    }
+
     fun getDebugInfo(): String = buildString {
         appendLine("=== Authorized Senders Manager Debug Info ===")
         appendLine("Enabled: ${_enabled.value}")
         appendLine("Authorized fingerprint count: ${_authorizedFingerprints.value.size}")
+        appendLine("Blocked attempts this session: ${_blockedAttempts.value.size}")
     }
 }

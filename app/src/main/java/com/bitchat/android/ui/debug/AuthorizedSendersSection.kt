@@ -20,6 +20,9 @@ import com.bitchat.android.mesh.AuthorizedSendersManager
 import com.bitchat.android.mesh.BluetoothMeshService
 import com.bitchat.android.ui.theme.BitchatFontFamily
 import kotlinx.coroutines.delay
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * Section for the flood-authorization allowlist: only peers whose verified fingerprint is
@@ -37,10 +40,12 @@ fun AuthorizedSendersSection(meshService: BluetoothMeshService) {
     val manager = remember { AuthorizedSendersManager.getInstance() }
     val enabled by manager.enabled.collectAsState()
     val authorizedFingerprints by manager.authorizedFingerprints.collectAsState()
+    val blockedAttempts by manager.blockedAttempts.collectAsState()
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
 
     var manualFingerprint by remember { mutableStateOf("") }
+    var showTrustQrSheet by remember { mutableStateOf(false) }
 
     // Own fingerprint, so the operator can share it with other nodes to get authorized there.
     val myFingerprint = remember {
@@ -87,6 +92,59 @@ fun AuthorizedSendersSection(meshService: BluetoothMeshService) {
                 color = colorScheme.onSurface.copy(alpha = 0.7f)
             )
 
+            Divider()
+
+            // Live signal that the block is actually happening — updates the instant
+            // SecurityManager drops a packet, no polling needed (real StateFlow).
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Blocked attempts (${blockedAttempts.size})",
+                    fontFamily = BitchatFontFamily,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f)
+                )
+                if (blockedAttempts.isNotEmpty()) {
+                    TextButton(onClick = { manager.clearBlockedAttempts() }) { Text("Clear") }
+                }
+            }
+            if (blockedAttempts.isEmpty()) {
+                Text(
+                    "Nothing blocked yet. Send a public message from an un-authorized " +
+                        "device and an entry will appear here the instant it's dropped.",
+                    fontFamily = BitchatFontFamily,
+                    fontSize = 11.sp,
+                    color = colorScheme.onSurface.copy(alpha = 0.6f)
+                )
+            } else {
+                val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    blockedAttempts.take(5).forEach { attempt ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    "${attempt.nickname} · ${attempt.messageType}",
+                                    fontFamily = BitchatFontFamily,
+                                    fontSize = 12.sp,
+                                    color = Color(0xFFD32F2F)
+                                )
+                                Text(
+                                    "${attempt.fingerprint.take(12)}… · ${timeFormat.format(Date(attempt.timestamp))}",
+                                    fontFamily = BitchatFontFamily,
+                                    fontSize = 10.sp,
+                                    color = colorScheme.onSurface.copy(alpha = 0.6f)
+                                )
+                            }
+                            TextButton(onClick = { manager.addAuthorizedFingerprint(attempt.fingerprint) }) {
+                                Text("Authorize")
+                            }
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
             if (myFingerprint != null) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
@@ -102,6 +160,10 @@ fun AuthorizedSendersSection(meshService: BluetoothMeshService) {
                         clipboardManager.setText(AnnotatedString(myFingerprint))
                         Toast.makeText(context, "Fingerprint copied", Toast.LENGTH_SHORT).show()
                     }) { Text("Copy") }
+                }
+
+                TextButton(onClick = { showTrustQrSheet = true }) {
+                    Text("Show / Scan Trust QR")
                 }
             }
 
@@ -133,7 +195,7 @@ fun AuthorizedSendersSection(meshService: BluetoothMeshService) {
                                 modifier = Modifier.weight(1f)
                             )
                             TextButton(onClick = { manager.removeAuthorizedFingerprint(fp) }) {
-                                Text("Remove")
+                                Text("Revoke")
                             }
                         }
                     }
@@ -193,4 +255,10 @@ fun AuthorizedSendersSection(meshService: BluetoothMeshService) {
             }
         }
     }
+
+    TrustQrExchangeSheet(
+        isPresented = showTrustQrSheet,
+        onDismiss = { showTrustQrSheet = false },
+        myPeerID = meshService.myPeerID
+    )
 }

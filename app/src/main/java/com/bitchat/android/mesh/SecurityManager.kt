@@ -397,6 +397,12 @@ class SecurityManager(private val encryptionService: EncryptionService, private 
         val authorized = authManager.isAuthorized(fingerprint)
         if (!authorized) {
             Log.w(TAG, "Dropping $messageType from $peerID: sender is not on the flood-authorized list")
+            authManager.recordBlockedAttempt(
+                fingerprint = fingerprint,
+                peerID = peerID,
+                nickname = delegate?.getPeerInfo(peerID)?.nickname ?: peerID,
+                messageType = messageType.name
+            )
         }
         return authorized
     }

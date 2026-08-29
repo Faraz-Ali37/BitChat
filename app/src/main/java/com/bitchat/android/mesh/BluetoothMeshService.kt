@@ -137,6 +137,7 @@ class BluetoothMeshService(private val context: Context) : TransportBridgeServic
         }
         Log.i(TAG, "Initializing BluetoothMeshService for peer=$myPeerID")
         VerificationService.configure(encryptionService)
+        TrustQrService.configure(encryptionService)
         setupDelegates()
         messageHandler.packetProcessor = packetProcessor
         //startPeriodicDebugLogging()
