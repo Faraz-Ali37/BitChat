@@ -1,0 +1,29 @@
+From 4b7e2f1d9c8a4e6f8a3d5c7b9e1f2a34 Mon Sep 17 00:00:00 2001
+From: bitchat development <dev@localhost>
+Date: Sat, 29 Aug 2026 18:20:00 +0500
+Subject: [PATCH 0004] Add one-tap revoke to authorized sender list
+
+Make revocation explicit in the main authorized-senders list. Each
+authorized fingerprint now has a one-tap "Revoke" action which immediately
+removes it from the local persisted allowlist.
+
+---
+ .../ui/debug/AuthorizedSendersSection.kt           | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/app/src/main/java/com/bitchat/android/ui/debug/AuthorizedSendersSection.kt b/app/src/main/java/com/bitchat/android/ui/debug/AuthorizedSendersSection.kt
+index 0ef942c..5c7d9ab 100644
+--- a/app/src/main/java/com/bitchat/android/ui/debug/AuthorizedSendersSection.kt
++++ b/app/src/main/java/com/bitchat/android/ui/debug/AuthorizedSendersSection.kt
+@@ -142,7 +142,7 @@ fun AuthorizedSendersSection(meshService: BluetoothMeshService) {
+                                 fontSize = 11.sp,
+                                 modifier = Modifier.weight(1f)
+                             )
+                             TextButton(onClick = { manager.removeAuthorizedFingerprint(fp) }) {
+-                                Text("Remove")
++                                Text("Revoke")
+                             }
+                         }
+                     }
+-- 
+2.45.2

@@ -1,0 +1,534 @@
+From 90e6e8f72562e7db815f304be94f83fd8f7eb2a3 Mon Sep 17 00:00:00 2001
+From: Extra <dev@example.com>
+Date: Fri, 28 Aug 2026 03:47:20 +0000
+Subject: [PATCH] Add flood-authorization allowlist for public mesh messages
+
+Only peers whose verified fingerprint is on a local allowlist get their
+MESSAGE/FILE_TRANSFER packets accepted and relayed by this node. Off by
+default; every relaying node needs it enabled with the same fingerprint
+set for it to act as a network-wide restriction.
+---
+ .../com/bitchat/android/BitchatApplication.kt |   9 +
+ .../android/mesh/AuthorizedSendersManager.kt  |  99 +++++++++
+ .../AuthorizedSendersPreferenceManager.kt     |  52 +++++
+ .../android/mesh/BluetoothMeshService.kt      |   6 +
+ .../android/mesh/PeerFingerprintManager.kt    |  13 ++
+ .../bitchat/android/mesh/SecurityManager.kt   |  48 +++++
+ .../ui/debug/AuthorizedSendersSection.kt      | 196 ++++++++++++++++++
+ .../android/ui/debug/DebugSettingsSheet.kt    |   5 +
+ 8 files changed, 428 insertions(+)
+ create mode 100644 app/src/main/java/com/bitchat/android/mesh/AuthorizedSendersManager.kt
+ create mode 100644 app/src/main/java/com/bitchat/android/mesh/AuthorizedSendersPreferenceManager.kt
+ create mode 100644 app/src/main/java/com/bitchat/android/ui/debug/AuthorizedSendersSection.kt
+
+diff --git a/app/src/main/java/com/bitchat/android/BitchatApplication.kt b/app/src/main/java/com/bitchat/android/BitchatApplication.kt
+index 7b5926e..466dea8 100644
+--- a/app/src/main/java/com/bitchat/android/BitchatApplication.kt
++++ b/app/src/main/java/com/bitchat/android/BitchatApplication.kt
+@@ -54,6 +54,15 @@ class BitchatApplication : Application() {
+         // Initialize debug preference manager (persists debug toggles)
+         try { com.bitchat.android.ui.debug.DebugPreferenceManager.init(this) } catch (_: Exception) { }
+ 
++        // Initialize the flood-authorization allowlist (persists the enable flag + trusted
++        // sender fingerprints used to gate public message relay — see SecurityManager).
++        try {
++            com.bitchat.android.mesh.AuthorizedSendersPreferenceManager.init(this)
++            // Re-read persisted values now that prefs are ready, in case
++            // AuthorizedSendersManager.getInstance() was created earlier with defaults.
++            com.bitchat.android.mesh.AuthorizedSendersManager.getInstance().reloadFromPreferences()
++        } catch (_: Exception) { }
++
+         // Initialize Wi‑Fi Aware controller with persisted default
+         try {
+             val enabled = com.bitchat.android.ui.debug.DebugPreferenceManager.getWifiAwareEnabled(false)
+diff --git a/app/src/main/java/com/bitchat/android/mesh/AuthorizedSendersManager.kt b/app/src/main/java/com/bitchat/android/mesh/AuthorizedSendersManager.kt
+new file mode 100644
+index 0000000..fd7f6e7
+--- /dev/null
++++ b/app/src/main/java/com/bitchat/android/mesh/AuthorizedSendersManager.kt
+@@ -0,0 +1,99 @@
++package com.bitchat.android.mesh
++
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/**
++ * Flood-authorization allowlist.
++ *
++ * When enabled, [SecurityManager] consults this manager to decide whether a public
++ * broadcast packet (MESSAGE / FILE_TRANSFER — the packet types that get flooded across
++ * the whole mesh) from a given peer is allowed to be accepted and relayed onward.
++ * Only peers whose verified identity fingerprint is in [authorizedFingerprints] pass.
++ *
++ * This is a *local, per-device* policy. For it to behave as a network-wide restriction,
++ * every relaying node needs the feature turned on with a matching set of fingerprints —
++ * there is no central authority to push that config in a decentralized mesh, so
++ * fingerprints must be shared and entered on each device out-of-band (e.g. read aloud,
++ * QR code, or copy/paste over another trusted channel).
++ *
++ * Disabled by default so a stock build keeps today's open-relay behavior.
++ */
++class AuthorizedSendersManager private constructor() {
++
++    companion object {
++        @Volatile
++        private var INSTANCE: AuthorizedSendersManager? = null
++
++        fun getInstance(): AuthorizedSendersManager {
++            return INSTANCE ?: synchronized(this) {
++                INSTANCE ?: AuthorizedSendersManager().also { INSTANCE = it }
++            }
++        }
++    }
++
++    private val _enabled = MutableStateFlow(false)
++    val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
++
++    private val _authorizedFingerprints = MutableStateFlow<Set<String>>(emptySet())
++    val authorizedFingerprints: StateFlow<Set<String>> = _authorizedFingerprints.asStateFlow()
++
++    init {
++        try {
++            _enabled.value = AuthorizedSendersPreferenceManager.getEnabled(false)
++            _authorizedFingerprints.value = AuthorizedSendersPreferenceManager.getAuthorizedFingerprints()
++        } catch (_: Exception) {
++            // Preferences not ready yet (e.g. accessed before BitchatApplication.onCreate);
++            // keep in-memory defaults and persist normally on the next mutation.
++        }
++    }
++
++    /**
++     * Re-read persisted values from [AuthorizedSendersPreferenceManager]. Call this once
++     * preferences are known to be initialized (e.g. from BitchatApplication.onCreate) to
++     * cover the case where this singleton was first touched earlier than that with defaults.
++     */
++    fun reloadFromPreferences() {
++        try {
++            _enabled.value = AuthorizedSendersPreferenceManager.getEnabled(false)
++            _authorizedFingerprints.value = AuthorizedSendersPreferenceManager.getAuthorizedFingerprints()
++        } catch (_: Exception) { }
++    }
++
++    fun isEnabled(): Boolean = _enabled.value
++
++    fun setEnabled(value: Boolean) {
++        _enabled.value = value
++        try { AuthorizedSendersPreferenceManager.setEnabled(value) } catch (_: Exception) { }
++    }
++
++    /**
++     * True if [fingerprint] (hex SHA-256 of a peer's Noise static public key — see
++     * [PeerFingerprintManager.fingerprintFor]) is on the allowlist.
++     */
++    fun isAuthorized(fingerprint: String): Boolean {
++        return _authorizedFingerprints.value.contains(fingerprint.lowercase())
++    }
++
++    fun addAuthorizedFingerprint(fingerprint: String) {
++        val normalized = fingerprint.trim().lowercase()
++        if (normalized.isEmpty()) return
++        val updated = _authorizedFingerprints.value + normalized
++        _authorizedFingerprints.value = updated
++        try { AuthorizedSendersPreferenceManager.setAuthorizedFingerprints(updated) } catch (_: Exception) { }
++    }
++
++    fun removeAuthorizedFingerprint(fingerprint: String) {
++        val normalized = fingerprint.trim().lowercase()
++        val updated = _authorizedFingerprints.value - normalized
++        _authorizedFingerprints.value = updated
++        try { AuthorizedSendersPreferenceManager.setAuthorizedFingerprints(updated) } catch (_: Exception) { }
++    }
++
++    fun getDebugInfo(): String = buildString {
++        appendLine("=== Authorized Senders Manager Debug Info ===")
++        appendLine("Enabled: ${_enabled.value}")
++        appendLine("Authorized fingerprint count: ${_authorizedFingerprints.value.size}")
++    }
++}
+diff --git a/app/src/main/java/com/bitchat/android/mesh/AuthorizedSendersPreferenceManager.kt b/app/src/main/java/com/bitchat/android/mesh/AuthorizedSendersPreferenceManager.kt
+new file mode 100644
+index 0000000..ac3802f
+--- /dev/null
++++ b/app/src/main/java/com/bitchat/android/mesh/AuthorizedSendersPreferenceManager.kt
+@@ -0,0 +1,52 @@
++package com.bitchat.android.mesh
++
++import android.content.Context
++import android.content.SharedPreferences
++
++/**
++ * SharedPreferences-backed persistence for the flood-authorization allowlist.
++ *
++ * Stores:
++ *  - a master enable/disable flag (feature defaults OFF: an un-configured node keeps
++ *    today's open-relay behavior, so this is strictly opt-in)
++ *  - the set of authorized sender fingerprints (hex-encoded SHA-256 of each peer's
++ *    Noise static public key, i.e. the same "fingerprint" already surfaced by
++ *    VerificationSheet / PeerFingerprintManager)
++ *
++ * NOTE: This allowlist is local to this device/app install. There is no central
++ * authority in the mesh, so "network-wide" enforcement only holds if every
++ * participating node runs this build with flood-authorization enabled and is
++ * configured with the same set of trusted fingerprints (share fingerprints via
++ * an out-of-band channel and add them on each device).
++ */
++object AuthorizedSendersPreferenceManager {
++    private const val PREFS_NAME = "bitchat_authorized_senders"
++    private const val KEY_ENABLED = "flood_authorization_enabled"
++    private const val KEY_FINGERPRINTS = "authorized_fingerprints"
++
++    private lateinit var prefs: SharedPreferences
++
++    fun init(context: Context) {
++        prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
++    }
++
++    private fun ready(): Boolean = ::prefs.isInitialized
++
++    fun getEnabled(default: Boolean = false): Boolean =
++        if (ready()) prefs.getBoolean(KEY_ENABLED, default) else default
++
++    fun setEnabled(value: Boolean) {
++        if (ready()) prefs.edit().putBoolean(KEY_ENABLED, value).apply()
++    }
++
++    fun getAuthorizedFingerprints(): Set<String> =
++        if (ready()) (prefs.getStringSet(KEY_FINGERPRINTS, null) ?: emptySet()).toSet() else emptySet()
++
++    fun setAuthorizedFingerprints(fingerprints: Set<String>) {
++        if (ready()) {
++            // Copy into a fresh HashSet: SharedPreferences must not persist a mutable set
++            // instance that the caller might go on to mutate in place.
++            prefs.edit().putStringSet(KEY_FINGERPRINTS, HashSet(fingerprints)).apply()
++        }
++    }
++}
+diff --git a/app/src/main/java/com/bitchat/android/mesh/BluetoothMeshService.kt b/app/src/main/java/com/bitchat/android/mesh/BluetoothMeshService.kt
+index 22f1786..b3149ea 100644
+--- a/app/src/main/java/com/bitchat/android/mesh/BluetoothMeshService.kt
++++ b/app/src/main/java/com/bitchat/android/mesh/BluetoothMeshService.kt
+@@ -1393,6 +1393,12 @@ class BluetoothMeshService(private val context: Context) : TransportBridgeServic
+      * Get peer nicknames
+      */
+     fun getPeerNicknames(): Map<String, String> = peerManager.getAllPeerNicknames()
++
++    /**
++     * Get currently active peer IDs (for UI surfaces that need a live peer list,
++     * e.g. the flood-authorization allowlist editor)
++     */
++    fun getActivePeerIDs(): List<String> = peerManager.getActivePeerIDs()
+     
+     /**
+      * Get peer RSSI values  
+diff --git a/app/src/main/java/com/bitchat/android/mesh/PeerFingerprintManager.kt b/app/src/main/java/com/bitchat/android/mesh/PeerFingerprintManager.kt
+index c48b5bd..5c344af 100644
+--- a/app/src/main/java/com/bitchat/android/mesh/PeerFingerprintManager.kt
++++ b/app/src/main/java/com/bitchat/android/mesh/PeerFingerprintManager.kt
+@@ -35,6 +35,19 @@ class PeerFingerprintManager private constructor() {
+                 INSTANCE ?: PeerFingerprintManager().also { INSTANCE = it }
+             }
+         }
++
++        /**
++         * Public, stateless helper to compute the SHA-256 fingerprint for any static public key.
++         * Exposed so other components (e.g. AuthorizedSendersManager) can compare a peer's
++         * verified key against a stored allowlist using the exact same identity representation
++         * shown to users elsewhere in the app (VerificationSheet, etc.), without needing an
++         * established peer/session entry.
++         */
++        fun fingerprintFor(publicKey: ByteArray): String {
++            val digest = MessageDigest.getInstance("SHA-256")
++            val hash = digest.digest(publicKey)
++            return hash.joinToString("") { "%02x".format(it) }
++        }
+     }
+     
+     // Bidirectional mapping for efficient lookups
+diff --git a/app/src/main/java/com/bitchat/android/mesh/SecurityManager.kt b/app/src/main/java/com/bitchat/android/mesh/SecurityManager.kt
+index 3f68467..cd7ba46 100644
+--- a/app/src/main/java/com/bitchat/android/mesh/SecurityManager.kt
++++ b/app/src/main/java/com/bitchat/android/mesh/SecurityManager.kt
+@@ -93,6 +93,17 @@ class SecurityManager(private val encryptionService: EncryptionService, private
+             return false
+         }
+ 
++        // Flood-authorization allowlist: only applies to packet types that get
++        // broadcast/flooded across the whole mesh (public messages, files). Handshakes,
++        // announces, leaves, sync, etc. are left untouched so presence/discovery and
++        // private (directly-addressed) traffic keep working normally even when this
++        // policy is on. Returning false here drops the packet before it reaches
++        // PacketRelayManager, so an unauthorized message is neither shown locally nor
++        // relayed onward by this node.
++        if (!isAuthorizedToFlood(packet, peerID)) {
++            return false
++        }
++
+         // Record only authenticated packets. Recording an attacker-controlled
+         // invalid packet first would let it poison duplicate detection for a
+         // later legitimate packet with the same timestamp and payload.
+@@ -353,6 +364,43 @@ class SecurityManager(private val encryptionService: EncryptionService, private
+         }
+     }
+     
++    /**
++     * Enforce the flood-authorization allowlist (see [AuthorizedSendersManager]) for the
++     * subset of packet types that actually get flooded across the whole mesh. Every other
++     * packet type (handshakes, ANNOUNCE, LEAVE, REQUEST_SYNC, fragments, etc.) is exempt so
++     * peer discovery and private messaging are unaffected by this policy.
++     *
++     * The identity check is anchored to the peer's Noise static public key fingerprint,
++     * i.e. the same identity already established via [verifyPacketSignature] for this
++     * packet (ANNOUNCE binds the signing key to the Noise key, and every MESSAGE/
++     * FILE_TRANSFER signature above was just verified against that bound signing key) —
++     * so a peer cannot pass this check without having proven ownership of the key first.
++     */
++    private fun isAuthorizedToFlood(packet: BitchatPacket, peerID: String): Boolean {
++        val messageType = MessageType.fromValue(packet.type)
++        if (messageType != MessageType.MESSAGE && messageType != MessageType.FILE_TRANSFER) {
++            return true
++        }
++
++        val authManager = AuthorizedSendersManager.getInstance()
++        if (!authManager.isEnabled()) {
++            return true
++        }
++
++        val noisePublicKey = delegate?.getPeerInfo(peerID)?.noisePublicKey
++        if (noisePublicKey == null) {
++            Log.w(TAG, "Dropping $messageType from $peerID: no verified identity key on file yet")
++            return false
++        }
++
++        val fingerprint = PeerFingerprintManager.fingerprintFor(noisePublicKey)
++        val authorized = authManager.isAuthorized(fingerprint)
++        if (!authorized) {
++            Log.w(TAG, "Dropping $messageType from $peerID: sender is not on the flood-authorized list")
++        }
++        return authorized
++    }
++
+     /**
+      * Check if we have encryption keys for a peer
+      */
+diff --git a/app/src/main/java/com/bitchat/android/ui/debug/AuthorizedSendersSection.kt b/app/src/main/java/com/bitchat/android/ui/debug/AuthorizedSendersSection.kt
+new file mode 100644
+index 0000000..34b9954
+--- /dev/null
++++ b/app/src/main/java/com/bitchat/android/ui/debug/AuthorizedSendersSection.kt
+@@ -0,0 +1,196 @@
++package com.bitchat.android.ui.debug
++
++import android.widget.Toast
++import androidx.compose.foundation.layout.*
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Lock
++import androidx.compose.material3.*
++import androidx.compose.runtime.*
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalClipboardManager
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.AnnotatedString
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.bitchat.android.mesh.AuthorizedSendersManager
++import com.bitchat.android.mesh.BluetoothMeshService
++import com.bitchat.android.ui.theme.BitchatFontFamily
++import kotlinx.coroutines.delay
++
++/**
++ * Section for the flood-authorization allowlist: only peers whose verified fingerprint is
++ * listed here will have their public messages/files accepted and relayed by this node once
++ * enabled. See [AuthorizedSendersManager] and SecurityManager.isAuthorizedToFlood for the
++ * enforcement side.
++ *
++ * This is a *local* policy editor. For it to act as a network-wide restriction, every
++ * relaying device needs this feature on with the same fingerprint set — share fingerprints
++ * with other operators out-of-band and add them on each device.
++ */
++@Composable
++fun AuthorizedSendersSection(meshService: BluetoothMeshService) {
++    val colorScheme = MaterialTheme.colorScheme
++    val manager = remember { AuthorizedSendersManager.getInstance() }
++    val enabled by manager.enabled.collectAsState()
++    val authorizedFingerprints by manager.authorizedFingerprints.collectAsState()
++    val context = LocalContext.current
++    val clipboardManager = LocalClipboardManager.current
++
++    var manualFingerprint by remember { mutableStateOf("") }
++
++    // Own fingerprint, so the operator can share it with other nodes to get authorized there.
++    val myFingerprint = remember {
++        try { meshService.getIdentityFingerprint() } catch (_: Exception) { null }
++    }
++
++    // Nearby peers, refreshed periodically while this section is visible so newly-seen
++    // peers show up without needing a dedicated ViewModel wiring.
++    var nearbyPeers by remember { mutableStateOf<List<Triple<String, String, String?>>>(emptyList()) }
++    LaunchedEffect(Unit) {
++        while (true) {
++            val nicknames = try { meshService.getPeerNicknames() } catch (_: Exception) { emptyMap() }
++            nearbyPeers = try {
++                meshService.getActivePeerIDs().map { peerID ->
++                    Triple(peerID, nicknames[peerID] ?: peerID, meshService.getPeerFingerprint(peerID))
++                }
++            } catch (_: Exception) { emptyList() }
++            delay(3000)
++        }
++    }
++
++    Surface(shape = RoundedCornerShape(12.dp), color = colorScheme.surfaceVariant.copy(alpha = 0.2f)) {
++        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
++            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                Icon(Icons.Filled.Lock, contentDescription = null, tint = Color(0xFF34C759))
++                Text(
++                    "Flood authorization",
++                    fontFamily = BitchatFontFamily,
++                    fontSize = 14.sp,
++                    fontWeight = FontWeight.Medium
++                )
++                Spacer(Modifier.weight(1f))
++                Switch(checked = enabled, onCheckedChange = { manager.setEnabled(it) })
++            }
++
++            Text(
++                "When on, this device only accepts and relays public messages/files from " +
++                    "peers whose fingerprint is in the list below. Other traffic (handshakes, " +
++                    "presence, private messages) is unaffected. This is a local, per-device " +
++                    "setting — every relaying node needs it enabled with the same fingerprints " +
++                    "to enforce it network-wide.",
++                fontFamily = BitchatFontFamily,
++                fontSize = 11.sp,
++                color = colorScheme.onSurface.copy(alpha = 0.7f)
++            )
++
++            if (myFingerprint != null) {
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    Column(Modifier.weight(1f)) {
++                        Text(
++                            "Your fingerprint (share this so others can authorize you)",
++                            fontFamily = BitchatFontFamily,
++                            fontSize = 11.sp,
++                            color = colorScheme.onSurface.copy(alpha = 0.7f)
++                        )
++                        Text(myFingerprint, fontFamily = BitchatFontFamily, fontSize = 11.sp)
++                    }
++                    TextButton(onClick = {
++                        clipboardManager.setText(AnnotatedString(myFingerprint))
++                        Toast.makeText(context, "Fingerprint copied", Toast.LENGTH_SHORT).show()
++                    }) { Text("Copy") }
++                }
++            }
++
++            Divider()
++
++            Text(
++                "Authorized senders (${authorizedFingerprints.size})",
++                fontFamily = BitchatFontFamily,
++                fontSize = 12.sp,
++                fontWeight = FontWeight.Medium
++            )
++
++            if (authorizedFingerprints.isEmpty()) {
++                Text(
++                    "No authorized senders yet — add a fingerprint below, or authorize a " +
++                        "nearby peer from the list.",
++                    fontFamily = BitchatFontFamily,
++                    fontSize = 11.sp,
++                    color = colorScheme.onSurface.copy(alpha = 0.6f)
++                )
++            } else {
++                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                    authorizedFingerprints.sorted().forEach { fp ->
++                        Row(verticalAlignment = Alignment.CenterVertically) {
++                            Text(
++                                fp,
++                                fontFamily = BitchatFontFamily,
++                                fontSize = 11.sp,
++                                modifier = Modifier.weight(1f)
++                            )
++                            TextButton(onClick = { manager.removeAuthorizedFingerprint(fp) }) {
++                                Text("Remove")
++                            }
++                        }
++                    }
++                }
++            }
++
++            // Manual add (for fingerprints shared out-of-band, e.g. not currently nearby)
++            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                OutlinedTextField(
++                    value = manualFingerprint,
++                    onValueChange = { manualFingerprint = it },
++                    label = { Text("Paste fingerprint") },
++                    singleLine = true,
++                    modifier = Modifier.weight(1f)
++                )
++                Button(
++                    enabled = manualFingerprint.trim().isNotEmpty(),
++                    onClick = {
++                        manager.addAuthorizedFingerprint(manualFingerprint)
++                        manualFingerprint = ""
++                    }
++                ) { Text("Add") }
++            }
++
++            if (nearbyPeers.isNotEmpty()) {
++                Divider()
++                Text(
++                    "Nearby peers",
++                    fontFamily = BitchatFontFamily,
++                    fontSize = 12.sp,
++                    fontWeight = FontWeight.Medium
++                )
++                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                    nearbyPeers.forEach { (_, nickname, fingerprint) ->
++                        Row(verticalAlignment = Alignment.CenterVertically) {
++                            Column(Modifier.weight(1f)) {
++                                Text(nickname, fontFamily = BitchatFontFamily, fontSize = 12.sp)
++                                Text(
++                                    fingerprint ?: "no fingerprint yet (not handshaked)",
++                                    fontFamily = BitchatFontFamily,
++                                    fontSize = 10.sp,
++                                    color = colorScheme.onSurface.copy(alpha = 0.6f)
++                                )
++                            }
++                            if (fingerprint != null) {
++                                val isAuthorized = authorizedFingerprints.contains(fingerprint.lowercase())
++                                TextButton(onClick = {
++                                    if (isAuthorized) manager.removeAuthorizedFingerprint(fingerprint)
++                                    else manager.addAuthorizedFingerprint(fingerprint)
++                                }) {
++                                    Text(if (isAuthorized) "Revoke" else "Authorize")
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/bitchat/android/ui/debug/DebugSettingsSheet.kt b/app/src/main/java/com/bitchat/android/ui/debug/DebugSettingsSheet.kt
+index 9c8c48b..28ef3c0 100644
+--- a/app/src/main/java/com/bitchat/android/ui/debug/DebugSettingsSheet.kt
++++ b/app/src/main/java/com/bitchat/android/ui/debug/DebugSettingsSheet.kt
+@@ -455,6 +455,11 @@ fun DebugSettingsSheet(
+                 }
+             }
+ 
++            // Flood-authorization allowlist (only trusted peer fingerprints get relayed)
++            item {
++                AuthorizedSendersSection(meshService = meshService)
++            }
++
+             // Transport toggles (BLE + Wi‑Fi Aware)
+             item {
+                 Surface(shape = RoundedCornerShape(12.dp), color = colorScheme.surfaceVariant.copy(alpha = 0.2f)) {
+-- 
+2.43.0
+

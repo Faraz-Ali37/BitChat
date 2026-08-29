@@ -1,0 +1,177 @@
+diff --git a/app/src/main/java/com/bitchat/android/mesh/AuthorizedSendersManager.kt b/app/src/main/java/com/bitchat/android/mesh/AuthorizedSendersManager.kt
+index fd7f6e7..9ccefad 100644
+--- a/app/src/main/java/com/bitchat/android/mesh/AuthorizedSendersManager.kt
++++ b/app/src/main/java/com/bitchat/android/mesh/AuthorizedSendersManager.kt
+@@ -4,6 +4,18 @@ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ 
++/**
++ * A single dropped MESSAGE/FILE_TRANSFER packet, recorded for display so the effect of
++ * the allowlist is visible in the UI in real time rather than a silent no-op.
++ */
++data class BlockedFloodAttempt(
++    val fingerprint: String,
++    val peerID: String,
++    val nickname: String,
++    val messageType: String,
++    val timestamp: Long
++)
++
+ /**
+  * Flood-authorization allowlist.
+  *
+@@ -31,6 +43,10 @@ class AuthorizedSendersManager private constructor() {
+                 INSTANCE ?: AuthorizedSendersManager().also { INSTANCE = it }
+             }
+         }
++
++        // Bounded so a determined unauthorized sender can't grow this list forever;
++        // it only needs to be big enough to be visibly useful in a live demo/debug view.
++        private const val MAX_BLOCKED_ATTEMPTS = 50
+     }
+ 
+     private val _enabled = MutableStateFlow(false)
+@@ -39,6 +55,11 @@ class AuthorizedSendersManager private constructor() {
+     private val _authorizedFingerprints = MutableStateFlow<Set<String>>(emptySet())
+     val authorizedFingerprints: StateFlow<Set<String>> = _authorizedFingerprints.asStateFlow()
+ 
++    // In-memory only (not persisted): this is a live "is it working" signal for the
++    // current session, not an audit trail, so it intentionally resets on app restart.
++    private val _blockedAttempts = MutableStateFlow<List<BlockedFloodAttempt>>(emptyList())
++    val blockedAttempts: StateFlow<List<BlockedFloodAttempt>> = _blockedAttempts.asStateFlow()
++
+     init {
+         try {
+             _enabled.value = AuthorizedSendersPreferenceManager.getEnabled(false)
+@@ -91,9 +112,31 @@ class AuthorizedSendersManager private constructor() {
+         try { AuthorizedSendersPreferenceManager.setAuthorizedFingerprints(updated) } catch (_: Exception) { }
+     }
+ 
++    /**
++     * Record a dropped MESSAGE/FILE_TRANSFER packet so it's visible in the UI. Called by
++     * [SecurityManager] at the exact point a packet is rejected — see
++     * SecurityManager.isAuthorizedToFlood.
++     */
++    fun recordBlockedAttempt(fingerprint: String, peerID: String, nickname: String, messageType: String) {
++        val attempt = BlockedFloodAttempt(
++            fingerprint = fingerprint,
++            peerID = peerID,
++            nickname = nickname,
++            messageType = messageType,
++            timestamp = System.currentTimeMillis()
++        )
++        // Newest first, capped.
++        _blockedAttempts.value = (listOf(attempt) + _blockedAttempts.value).take(MAX_BLOCKED_ATTEMPTS)
++    }
++
++    fun clearBlockedAttempts() {
++        _blockedAttempts.value = emptyList()
++    }
++
+     fun getDebugInfo(): String = buildString {
+         appendLine("=== Authorized Senders Manager Debug Info ===")
+         appendLine("Enabled: ${_enabled.value}")
+         appendLine("Authorized fingerprint count: ${_authorizedFingerprints.value.size}")
++        appendLine("Blocked attempts this session: ${_blockedAttempts.value.size}")
+     }
+ }
+diff --git a/app/src/main/java/com/bitchat/android/mesh/SecurityManager.kt b/app/src/main/java/com/bitchat/android/mesh/SecurityManager.kt
+index cd7ba46..806e6e6 100644
+--- a/app/src/main/java/com/bitchat/android/mesh/SecurityManager.kt
++++ b/app/src/main/java/com/bitchat/android/mesh/SecurityManager.kt
+@@ -397,6 +397,12 @@ class SecurityManager(private val encryptionService: EncryptionService, private
+         val authorized = authManager.isAuthorized(fingerprint)
+         if (!authorized) {
+             Log.w(TAG, "Dropping $messageType from $peerID: sender is not on the flood-authorized list")
++            authManager.recordBlockedAttempt(
++                fingerprint = fingerprint,
++                peerID = peerID,
++                nickname = delegate?.getPeerInfo(peerID)?.nickname ?: peerID,
++                messageType = messageType.name
++            )
+         }
+         return authorized
+     }
+diff --git a/app/src/main/java/com/bitchat/android/ui/debug/AuthorizedSendersSection.kt b/app/src/main/java/com/bitchat/android/ui/debug/AuthorizedSendersSection.kt
+index 34b9954..9732567 100644
+--- a/app/src/main/java/com/bitchat/android/ui/debug/AuthorizedSendersSection.kt
++++ b/app/src/main/java/com/bitchat/android/ui/debug/AuthorizedSendersSection.kt
+@@ -20,6 +20,9 @@ import com.bitchat.android.mesh.AuthorizedSendersManager
+ import com.bitchat.android.mesh.BluetoothMeshService
+ import com.bitchat.android.ui.theme.BitchatFontFamily
+ import kotlinx.coroutines.delay
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
+ 
+ /**
+  * Section for the flood-authorization allowlist: only peers whose verified fingerprint is
+@@ -37,6 +40,7 @@ fun AuthorizedSendersSection(meshService: BluetoothMeshService) {
+     val manager = remember { AuthorizedSendersManager.getInstance() }
+     val enabled by manager.enabled.collectAsState()
+     val authorizedFingerprints by manager.authorizedFingerprints.collectAsState()
++    val blockedAttempts by manager.blockedAttempts.collectAsState()
+     val context = LocalContext.current
+     val clipboardManager = LocalClipboardManager.current
+ 
+@@ -87,6 +91,59 @@ fun AuthorizedSendersSection(meshService: BluetoothMeshService) {
+                 color = colorScheme.onSurface.copy(alpha = 0.7f)
+             )
+ 
++            Divider()
++
++            // Live signal that the block is actually happening — updates the instant
++            // SecurityManager drops a packet, no polling needed (real StateFlow).
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                Text(
++                    "Blocked attempts (${blockedAttempts.size})",
++                    fontFamily = BitchatFontFamily,
++                    fontSize = 12.sp,
++                    fontWeight = FontWeight.Medium,
++                    modifier = Modifier.weight(1f)
++                )
++                if (blockedAttempts.isNotEmpty()) {
++                    TextButton(onClick = { manager.clearBlockedAttempts() }) { Text("Clear") }
++                }
++            }
++            if (blockedAttempts.isEmpty()) {
++                Text(
++                    "Nothing blocked yet. Send a public message from an un-authorized " +
++                        "device and an entry will appear here the instant it's dropped.",
++                    fontFamily = BitchatFontFamily,
++                    fontSize = 11.sp,
++                    color = colorScheme.onSurface.copy(alpha = 0.6f)
++                )
++            } else {
++                val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
++                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                    blockedAttempts.take(5).forEach { attempt ->
++                        Row(verticalAlignment = Alignment.CenterVertically) {
++                            Column(Modifier.weight(1f)) {
++                                Text(
++                                    "${attempt.nickname} · ${attempt.messageType}",
++                                    fontFamily = BitchatFontFamily,
++                                    fontSize = 12.sp,
++                                    color = Color(0xFFD32F2F)
++                                )
++                                Text(
++                                    "${attempt.fingerprint.take(12)}… · ${timeFormat.format(Date(attempt.timestamp))}",
++                                    fontFamily = BitchatFontFamily,
++                                    fontSize = 10.sp,
++                                    color = colorScheme.onSurface.copy(alpha = 0.6f)
++                                )
++                            }
++                            TextButton(onClick = { manager.addAuthorizedFingerprint(attempt.fingerprint) }) {
++                                Text("Authorize")
++                            }
++                        }
++                    }
++                }
++            }
++
++            Divider()
++
+             if (myFingerprint != null) {
+                 Row(verticalAlignment = Alignment.CenterVertically) {
+                     Column(Modifier.weight(1f)) {
